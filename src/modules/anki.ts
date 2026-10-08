@@ -75,6 +75,7 @@ export interface CardInput {
   note?: CardNoteRef;                    // 条目名 + zotero:// 链接
   cite?: string;                         // 文献条目信息（作者 · 年份 · 期刊），Zotero 版新增
   bundle?: DictLookupBundle | null;      // 结构化在线词典结果
+  translation?: string;                 // 词典无结果时从 Translate for Zotero 读取的译文
 }
 
 export interface AddCardResult { ok: boolean; added: boolean; skipped: boolean; message: string }
@@ -101,8 +102,8 @@ function buildFieldContent(src: AnkiFieldSource, input: CardInput, bundle: DictL
   switch (src) {
     case "word": return escHtml(input.word.trim());
     case "phonetic": return escHtml(bundlePhoneticText(bundle));
-    case "def_single": return bundle ? singleDefHtml(bundle) : "";
-    case "def_all": return bundle ? allDefsHtml(bundle) : "";
+    case "def_single": return bundle ? singleDefHtml(bundle) : (input.translation ? `<span style="color:#0d47a1">${escHtml(input.translation)}</span>` : "");
+    case "def_all": return bundle ? allDefsHtml(bundle) : (input.translation ? `<span style="color:#0d47a1">${escHtml(input.translation)}</span>` : "");
     case "examples": return bundle ? examplesHtml(bundle) : "";
     case "extra": return bundle ? extrasHtml(bundle) : "";
     case "source": {
@@ -110,6 +111,7 @@ function buildFieldContent(src: AnkiFieldSource, input: CardInput, bundle: DictL
       const lines: string[] = [];
       const dictPart = bundleSourceText(bundle, undefined).trim();
       if (dictPart) lines.push(dictPart);
+      if (input.translation) lines.push("释义来源：Translate for Zotero");
       if (input.note?.uri) lines.push(`条目链接：${input.note.uri}`);
       else if (input.note?.name) lines.push(`来源条目：${input.note.name}`);
       if (input.cite) lines.push(input.cite);
