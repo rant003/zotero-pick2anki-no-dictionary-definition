@@ -18,32 +18,48 @@ import { edgeSynth, EDGE_VOICES } from "./edge-tts";
 import { fetchBinary as httpFetchBinary, request } from "./http";
 import { bytesToBase64 } from "./env";
 import { sha256Hex } from "./sha256";
+import { log } from "./env";
+import { AnkiApiError, AnkiTransportError, delay, hasPendingSubmission, submitAnkiNote } from "./anki-submit";
+import type { InvokeOptions } from "./anki-submit";
 
 // ---------- 底层 JSON-RPC ----------
-interface AnkiEnvelope<T> { result?: T; error?: string }
+interface AnkiEnvelope<T> { result?: T; error?: string | null }
 
-export async function ankiInvoke<T>(action: string, params: unknown, url: string): Promise<T> {
-  let resp;
-  try {
-    resp = await request(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ action, version: 6, params }),
-      timeout: 30000,
-    });
-  } catch (e) {
-    throw new Error("无法连接 AnkiConnect：" + (e instanceof Error ? e.message : String(e))
-      + "。请先启动 Anki 并安装/启用 AnkiConnect 插件（工具→插件→AnkiConnect）。");
+const READ_ACTIONS = new Set(["version", "deckNames", "modelNames", "modelFieldNames", "canAddNotes", "findNotes", "notesInfo"]);
+
+export async function ankiInvoke<T>(action: string, params: unknown, url: string, opts: InvokeOptions = {}): Promise<T> {
+  // Only read-only actions can be retried. addNote may have committed before its response was lost.
+  const retries = READ_ACTIONS.has(action) ? Math.min(2, Math.max(0, opts.retries ?? 2)) : 0;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      let resp;
+      try {
+        resp = await request(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action, version: 6, params }),
+          timeout: opts.timeout ?? 30000,
+        });
+      } catch (e) {
+        throw new AnkiTransportError(`AnkiConnect ${action} 请求异常：${e instanceof Error ? e.message : String(e)}`);
+      }
+      if (!resp || resp.status < 200 || resp.status >= 300) {
+        throw new AnkiTransportError(`AnkiConnect ${action} HTTP ${resp?.status ?? 0}：${url}`);
+      }
+      const data = resp.json as AnkiEnvelope<T> | null;
+      if (!data || typeof data !== "object" || !Object.prototype.hasOwnProperty.call(data, "result")
+        || !Object.prototype.hasOwnProperty.call(data, "error")
+        || (data.error !== null && typeof data.error !== "string")) {
+        throw new AnkiTransportError(`AnkiConnect ${action} 返回内容不是有效的接口响应`);
+      }
+      if (data.error) throw new AnkiApiError("Anki 错误：" + data.error);
+      return data.result as T;
+    } catch (e) {
+      log(`AnkiConnect ${action} 第 ${attempt + 1} 次请求失败：${e instanceof Error ? e.message : String(e)}`);
+      if (!(e instanceof AnkiTransportError) || attempt >= retries) throw e;
+      await delay((attempt + 1) * 200);
+    }
   }
-  if (!resp || resp.status === 0 || resp.status >= 400) {
-    throw new Error(`AnkiConnect HTTP ${resp?.status ?? 0}：无法访问 ${url}`);
-  }
-  let data: AnkiEnvelope<T>;
-  try { data = resp.json as AnkiEnvelope<T>; }
-  catch { throw new Error("AnkiConnect 返回内容不是合法 JSON"); }
-  if (!data || typeof data !== "object") throw new Error("AnkiConnect 返回内容不是合法 JSON");
-  if (typeof data.error === "string" && data.error) throw new Error("Anki 错误：" + data.error);
-  return data?.result as T;
 }
 
 export async function ankiVersion(url: string): Promise<number> {
@@ -78,7 +94,7 @@ export interface CardInput {
   translation?: string;                 // 词典无结果时从 Translate for Zotero 读取的译文
 }
 
-export interface AddCardResult { ok: boolean; added: boolean; skipped: boolean; message: string }
+export interface AddCardResult { ok: boolean; added: boolean; skipped: boolean; pending?: boolean; confirmed?: boolean; message: string }
 
 /** 写卡进度回调（用于把「音频/写卡」等阶段回显到 UI，避免用户以为卡住了） */
 export type CardProgress = (stage: string) => void;
@@ -215,11 +231,32 @@ async function storeAudio(s: Pick2ankiSettings, input: CardInput): Promise<{ fil
 }
 
 // ---------- 主入口：写入一张单词卡 ----------
-export async function addWordCard(
+const writesInFlight = new Map<string, Promise<AddCardResult>>();
+
+export function addWordCard(
+  s: Pick2ankiSettings, input: CardInput, modelFields?: string[], onProgress?: CardProgress,
+): Promise<AddCardResult> {
+  // Match a logical selection across reopened popups and restarts, even if dictionary HTML changes.
+  const key = sha256Hex(JSON.stringify([
+    s.ankiConnectUrl.replace(/\/$/, ""), s.ankiDeck, s.ankiNoteType,
+    input.word.trim().toLowerCase(), input.contextSentence || "",
+    input.note?.uri || input.note?.name || "",
+    Object.entries(s.ankiFieldMap || {}).sort(([a], [b]) => a.localeCompare(b)),
+  ]));
+  const existing = writesInFlight.get(key);
+  if (existing) return existing;
+  const task = performAddWordCard(s, input, modelFields, onProgress, key);
+  writesInFlight.set(key, task);
+  void task.finally(() => { if (writesInFlight.get(key) === task) writesInFlight.delete(key); }).catch(() => undefined);
+  return task;
+}
+
+async function performAddWordCard(
   s: Pick2ankiSettings,
   input: CardInput,
   modelFields?: string[],
   onProgress?: CardProgress,
+  submissionKey = "",
 ): Promise<AddCardResult> {
   const fail = (msg: string): AddCardResult => ({ ok: false, added: false, skipped: false, message: msg });
   if (!s.ankiEnabled) return fail("Anki 写卡未启用（设置 → 写入 Anki 单词卡）");
@@ -285,14 +322,19 @@ export async function addWordCard(
 
   try {
     onProgress?.("写卡…");
-    if (s.ankiDup === "skip") {
+    if (s.ankiDup === "skip" && !hasPendingSubmission(submissionKey)) {
       const can = await ankiInvoke<boolean[]>("canAddNotes", { notes: [note] }, s.ankiConnectUrl);
       if (Array.isArray(can) && can[0] === false) {
         return { ok: true, added: false, skipped: true, message: `「${input.word}」已存在牌组「${s.ankiDeck}」中，已跳过${missingWarn}` };
       }
     }
-    await ankiInvoke("addNote", { note }, s.ankiConnectUrl);
-    return { ok: true, added: true, skipped: false, message: `已写入 Anki：${input.word} → ${s.ankiDeck}${audioWarn}${missingWarn}` };
+    const submitted = await submitAnkiNote(note, s.ankiConnectUrl, submissionKey, ankiInvoke, onProgress);
+    if (!submitted.added) {
+      return { ok: false, added: false, skipped: false, pending: submitted.pending, message: submitted.message };
+    }
+    return { ok: true, added: true, skipped: false, confirmed: submitted.confirmed,
+      message: submitted.confirmed ? submitted.message
+        : `已写入 Anki：${input.word} → ${s.ankiDeck}${audioWarn}${missingWarn}` };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // 竞态/查重策略差异导致 addNote 抛出 duplicate 时也按“跳过”处理

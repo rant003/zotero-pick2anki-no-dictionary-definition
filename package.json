@@ -1,7 +1,7 @@
 {
   "name": "zotero-pick2anki",
   "type": "module",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Zotero 划词词典插件：PDF/EPub 阅读器里选中英文单词 → 5 个在线词典源聚合释义 → 一键通过 AnkiConnect 写入 Anki 生词卡",
   "config": {
     "addonName": "Pick2anki",
@@ -22,7 +22,8 @@
     "typecheck": "tsc --noEmit",
     "start": "zotero-plugin serve",
     "icons": "node scripts/make-icons.mjs",
-    "test": "node scripts/run-tests.mjs"
+    "test": "node scripts/run-tests.mjs",
+    "test:recovery": "node scripts/run-recovery-tests.mjs"
   },
   "keywords": [
     "zotero",

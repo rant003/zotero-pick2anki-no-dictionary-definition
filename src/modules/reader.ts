@@ -44,6 +44,7 @@ interface PopupState {
   ankiBtn: HTMLButtonElement | null;
   lookupBtn: HTMLButtonElement | null;
   adding: boolean;
+  completed: boolean;
   seq: number;
 }
 
@@ -168,6 +169,7 @@ function createPopup(doc: Document, word: string, event: ReaderSelectionEvent, s
     lookupBtn: null,
     msgEl: null,
     adding: false,
+    completed: false,
     seq: 0,
   };
 
@@ -268,7 +270,7 @@ function readTranslateForZoteroResult(doc: Document, selectedText: string): stri
 }
 
 async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings): Promise<void> {
-  if (state.adding) return;
+  if (state.adding || state.completed) return;
   const word = state.word.trim();
   if (!word) { setMessage(state, "请先选中一个单词/短语", true); return; }
   if (!canUseOnlineDict(word)) { setMessage(state, "仅英文单词/短语可写入 Anki 卡片", true); return; }
@@ -308,14 +310,16 @@ async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings
       setAnkiButton(state, "busy", stage);
     });
     if (!res.ok) {
-      setAnkiButton(state, "err");
-      setMessage(state, "Anki 写入失败：" + res.message, true);
+      setAnkiButton(state, res.pending ? "pending" : "err");
+      setMessage(state, (res.pending ? "Anki 写入结果待确认：" : "Anki 写入未完成：") + res.message, true);
     } else if (res.skipped) {
+      state.completed = true;
       setAnkiButton(state, "dup");
       setMessage(state, `「${word}」已存在，已跳过`);
     } else if (res.added) {
+      state.completed = true;
       setAnkiButton(state, "ok");
-      setMessage(state, missingDefinition
+      setMessage(state, res.confirmed ? res.message : missingDefinition
         ? (translation ? "已写入 Anki（释义来自 Translate for Zotero）" : "已写入 Anki（保留单词和原句）")
         : "");
     }
@@ -328,7 +332,7 @@ async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings
 }
 
 /** 弹窗 Anki 按钮状态：busy=⏳ 阶段名 / ok=✔ / dup=↺ / err=➕ */
-function setAnkiButton(state: PopupState, st: "busy" | "ok" | "dup" | "err", stage = ""): void {
+function setAnkiButton(state: PopupState, st: "busy" | "ok" | "dup" | "err" | "pending", stage = ""): void {
   const btn = state.ankiBtn;
   if (!btn) return;
   btn.classList.remove("p2a-anki-ok", "p2a-anki-dup", "p2a-anki-err");
@@ -338,13 +342,16 @@ function setAnkiButton(state: PopupState, st: "busy" | "ok" | "dup" | "err", sta
     btn.disabled = true;
     return;
   }
-  btn.disabled = false;
+  btn.disabled = st === "ok" || st === "dup";
   if (st === "ok") {
     btn.textContent = "✔ Anki";
     btn.classList.add("p2a-anki-ok");
   } else if (st === "dup") {
     btn.textContent = "↺ 已有";
     btn.classList.add("p2a-anki-dup");
+  } else if (st === "pending") {
+    btn.textContent = "⟳ 核对";
+    btn.classList.add("p2a-anki-err");
   } else {
     btn.textContent = "➕ Anki";
     btn.classList.add("p2a-anki-err");
