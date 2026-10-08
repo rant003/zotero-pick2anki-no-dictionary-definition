@@ -242,17 +242,31 @@ async function runLookup(state: PopupState, settings: Pick2ankiSettings): Promis
   const bundle = await lookupWordOnline(state.word, sources);
   if (seq !== state.seq || !state.root.isConnected) return; // 弹窗已关闭或已发起新查询
   const has = dictHasContent(bundle);
-  state.bundle = has ? bundle : null;
+  // Keep unsuccessful results too, so the Anki action does not repeat the same lookup.
+  state.bundle = bundle;
   empty(state.dictEl);
   renderBundleInto(state.doc, state.dictEl, bundle);
   scrollToTop(state.dictEl);
   // 可选自动写卡（与 Obsidian 版同语义）
-  if (has && settings.ankiEnabled && settings.ankiAutoAdd) {
+  if (settings.ankiEnabled && settings.ankiAutoAdd) {
     await addSelectionToAnki(state, getSettings());
   }
 }
 
 // ---------- 写卡（全程静默：只在面板内更新按钮状态与一行提示，不弹系统浮窗） ----------
+/** Read the current selection translation exposed by Translate for Zotero. */
+function readTranslateForZoteroResult(doc: Document, selectedText: string): string {
+  try {
+    const popup = doc.querySelector(".selection-popup");
+    const textarea = popup?.querySelector<HTMLTextAreaElement>("textarea.zoteropdftranslate-popup-textarea");
+    const translation = String(textarea?.value || "").trim();
+    if (!translation || translation.toLowerCase() === selectedText.trim().toLowerCase()) return "";
+    return translation;
+  } catch {
+    return "";
+  }
+}
+
 async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings): Promise<void> {
   if (state.adding) return;
   const word = state.word.trim();
@@ -260,23 +274,25 @@ async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings
   if (!canUseOnlineDict(word)) { setMessage(state, "仅英文单词/短语可写入 Anki 卡片", true); return; }
   if (!settings.ankiEnabled) { setMessage(state, "Anki 写卡未启用：设置 → Pick2anki → 写入 Anki 单词卡", true); return; }
   if (!settings.ankiDeck || !settings.ankiNoteType) { setMessage(state, "请先在设置中配置目标牌组与模板", true); return; }
-  if ((settings.onlineDictSources || []).length === 0) { setMessage(state, "未启用任何词典源：设置 → Pick2anki → 在线词典查词", true); return; }
 
   state.adding = true;
   setAnkiButton(state, "busy", "准备…");
   setMessage(state, "");
   try {
-    let bundle = state.bundle;
-    if (!bundle) {
+    const sources = settings.onlineDictSources || [];
+    let lookupBundle = state.bundle;
+    if (!lookupBundle && sources.length > 0) {
       setAnkiButton(state, "busy", "查词…");
-      const b = await lookupWordOnline(word, settings.onlineDictSources);
-      bundle = dictHasContent(b) ? b : null;
-      state.bundle = bundle;
+      lookupBundle = await lookupWordOnline(word, sources);
+      state.bundle = lookupBundle;
     }
-    if (!bundle) {
-      setAnkiButton(state, "err");
-      setMessage(state, `词典未查到「${word}」的释义，未写入卡片（可检查网络或更换词典源）`, true);
-      return;
+    const bundle = lookupBundle && dictHasContent(lookupBundle) ? lookupBundle : null;
+    const missingDefinition = !bundle;
+    const translation = missingDefinition ? readTranslateForZoteroResult(state.doc, word) : "";
+    if (missingDefinition) {
+      setMessage(state, translation
+        ? "词典无结果，将使用 Translate for Zotero 的翻译填入释义"
+        : "词典未查到释义，仍将写入单词和原句");
     }
     const input: CardInput = {
       word,
@@ -286,8 +302,8 @@ async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings
         : undefined,
       cite: settings.showCite ? (state.itemCtx?.cite || undefined) : undefined,
       bundle,
+      translation,
     };
-    // 各阶段回显到按钮上（音频下载/上传最慢，用户能看出在做什么）
     const res = await addWordCard(settings, input, undefined, (stage) => {
       setAnkiButton(state, "busy", stage);
     });
@@ -299,7 +315,9 @@ async function addSelectionToAnki(state: PopupState, settings: Pick2ankiSettings
       setMessage(state, `「${word}」已存在，已跳过`);
     } else if (res.added) {
       setAnkiButton(state, "ok");
-      setMessage(state, ""); // 成功保持静默，按钮变 ✔ 即反馈
+      setMessage(state, missingDefinition
+        ? (translation ? "已写入 Anki（释义来自 Translate for Zotero）" : "已写入 Anki（保留单词和原句）")
+        : "");
     }
   } catch (e) {
     setAnkiButton(state, "err");
